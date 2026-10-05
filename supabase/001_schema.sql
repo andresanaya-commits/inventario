@@ -1,0 +1,59 @@
+-- Run in Supabase SQL Editor. Inventory writes happen exclusively in transactional RPCs.
+create extension if not exists pgcrypto;
+create table public.suppliers(id uuid primary key default gen_random_uuid(),name text not null,contact_name text,email text,phone text,notes text,active boolean not null default true,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create table public.categories(id uuid primary key default gen_random_uuid(),name text unique not null,description text,active boolean not null default true,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create table public.units(id uuid primary key default gen_random_uuid(),name text unique not null,active boolean not null default true,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create table public.profiles(id uuid primary key references auth.users(id),email text not null,name text not null,role text not null default 'SUPPLIER' check(role in ('ADMINISTRATOR','SUPPLIER')),supplier_id uuid references public.suppliers(id),active boolean not null default false,created_at timestamptz not null default now(),updated_at timestamptz not null default now(),check(role='ADMINISTRATOR' or supplier_id is not null or not active));
+create table public.items(id uuid primary key default gen_random_uuid(),name text not null,sku text unique not null,description text,category_id uuid not null references public.categories(id),unit_id uuid not null references public.units(id),notes text,active boolean not null default true,created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create table public.supplier_items(id uuid primary key default gen_random_uuid(),item_id uuid not null references public.items(id),supplier_id uuid not null references public.suppliers(id),minimum_stock numeric not null default 0 check(minimum_stock>=0),current_quantity numeric not null default 0,in_transit numeric not null default 0 check(in_transit=0),in_production numeric not null default 0 check(in_production=0),active boolean not null default true,notes text,created_at timestamptz not null default now(),updated_at timestamptz not null default now(),unique(item_id,supplier_id));
+create table public.inventory_movements(id uuid primary key default gen_random_uuid(),supplier_item_id uuid not null references public.supplier_items(id),item_id uuid not null references public.items(id),supplier_id uuid not null references public.suppliers(id),movement_type text not null check(movement_type in ('INITIAL','RECEIPT','USAGE','ADJUSTMENT','TRANSFER','PRODUCTION','OTHER')),quantity numeric not null,previous_quantity numeric not null,new_quantity numeric not null,reference text,notes text,user_id uuid not null references public.profiles(id),created_at timestamptz not null default now(),check(new_quantity=previous_quantity+quantity));
+create table public.incoming_inventory(id uuid primary key default gen_random_uuid(),supplier_item_id uuid not null references public.supplier_items(id),item_id uuid not null references public.items(id),supplier_id uuid not null references public.suppliers(id),quantity numeric not null check(quantity>0 and quantity<=1e12),stage text not null check(stage in ('TRANSIT','PRODUCTION')),status text not null default 'OPEN' check(status in ('OPEN','RECEIVED')),reference text,notes text,expected_date date not null,created_at timestamptz not null default now());
+create table public.settings(id uuid primary key default gen_random_uuid(),company_name text not null default 'Fresh Produce Co.',default_unit text default 'Pieces',warning_threshold numeric not null default 1.2 check(warning_threshold>=1),timezone text not null default 'America/Mexico_City',date_format text not null default 'en-US',created_at timestamptz not null default now(),updated_at timestamptz not null default now());
+create index on public.supplier_items(supplier_id);create index on public.inventory_movements(supplier_id,created_at desc);create index on public.inventory_movements(supplier_item_id,created_at desc);create index on public.incoming_inventory(supplier_id,status);create index on public.items(category_id);create index on public.profiles(supplier_id);
+create function public.is_admin() returns boolean language sql stable security definer set search_path=public as $$ select exists(select 1 from profiles where id=auth.uid() and active and role='ADMINISTRATOR') $$;
+create function public.own_supplier() returns uuid language sql stable security definer set search_path=public as $$ select supplier_id from profiles where id=auth.uid() and active and role='SUPPLIER' $$;
+create function public.is_active_user() returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from profiles where id=auth.uid() and active)$$;
+do $$declare t text; begin foreach t in array array['suppliers','categories','units','profiles','items','supplier_items','inventory_movements','incoming_inventory','settings'] loop execute format('alter table public.%I enable row level security',t); end loop;end$$;
+create policy supplier_read on suppliers for select to authenticated using(is_admin() or id=own_supplier());
+create policy supplier_manage on suppliers for all to authenticated using(is_admin()) with check(is_admin());
+create policy categories_read on categories for select to authenticated using(is_active_user());create policy categories_manage on categories for all to authenticated using(is_admin()) with check(is_admin());
+create policy units_read on units for select to authenticated using(is_active_user());create policy units_manage on units for all to authenticated using(is_admin()) with check(is_admin());
+create policy profiles_read on profiles for select to authenticated using(is_admin() or id=auth.uid());create policy profiles_manage on profiles for all to authenticated using(is_admin()) with check(is_admin());
+create policy items_read on items for select to authenticated using(is_admin() or exists(select 1 from supplier_items s where s.item_id=items.id and s.supplier_id=own_supplier() and s.active));create policy items_manage on items for all to authenticated using(is_admin()) with check(is_admin());
+create policy assignments_read on supplier_items for select to authenticated using(is_admin() or supplier_id=own_supplier());create policy assignments_insert on supplier_items for insert to authenticated with check(is_admin() and current_quantity=0);create policy assignments_update on supplier_items for update to authenticated using(is_admin()) with check(is_admin());
+create policy movements_read on inventory_movements for select to authenticated using(is_admin() or supplier_id=own_supplier());
+create policy incoming_read on incoming_inventory for select to authenticated using(is_admin() or supplier_id=own_supplier());
+create policy incoming_insert on incoming_inventory for insert to authenticated with check(status='OPEN' and (is_admin() or supplier_id=own_supplier()) and exists(select 1 from supplier_items a join items i on i.id=a.item_id join suppliers s on s.id=a.supplier_id where a.id=supplier_item_id and a.item_id=incoming_inventory.item_id and a.supplier_id=incoming_inventory.supplier_id and a.active and i.active and s.active));
+create policy settings_read on settings for select to authenticated using(is_active_user());create policy settings_manage on settings for all to authenticated using(is_admin()) with check(is_admin());
+-- Column grants disallow changing balances through REST even for administrators.
+revoke all on public.inventory_movements from authenticated,anon;
+grant select on public.inventory_movements to authenticated;
+revoke all on public.supplier_items from authenticated,anon;
+grant select on public.supplier_items to authenticated;
+grant insert(id,item_id,supplier_id,minimum_stock,current_quantity,in_transit,in_production,active,notes,created_at,updated_at) on public.supplier_items to authenticated;
+grant update(minimum_stock,active,notes,updated_at) on public.supplier_items to authenticated;
+revoke update,delete on public.incoming_inventory from authenticated,anon;
+create function public.record_movement(assignment uuid,kind text,delta numeric,ref text default '',memo text default '',confirmed boolean default false) returns public.inventory_movements language plpgsql security definer set search_path=public as $$
+declare a supplier_items; m inventory_movements; admin boolean:=is_admin();begin
+select * into a from supplier_items where id=assignment for update;
+if not found or not a.active or not exists(select 1 from items where id=a.item_id and active) or not exists(select 1 from suppliers where id=a.supplier_id and active) then raise exception 'Active assigned item not found';end if;
+if not admin and (a.supplier_id is distinct from own_supplier() or kind not in ('RECEIPT','USAGE','PRODUCTION')) then raise exception 'Forbidden';end if;
+if kind not in ('INITIAL','RECEIPT','USAGE','ADJUSTMENT','TRANSFER','PRODUCTION','OTHER') or delta=0 or delta is null or abs(delta)>1e12 or delta::text in ('NaN','Infinity','-Infinity') then raise exception 'Invalid movement';end if;
+if kind='USAGE' and delta>=0 or kind in ('INITIAL','RECEIPT','PRODUCTION') and delta<0 then raise exception 'Invalid quantity direction';end if;
+if kind='INITIAL' and exists(select 1 from inventory_movements where supplier_item_id=a.id) then raise exception 'Initial balance already exists';end if;
+if (abs(delta)>10000 or delta<0 and abs(delta)>a.current_quantity*0.5) and not confirmed then raise exception 'Confirmation required';end if;
+if a.current_quantity+delta<0 and not(admin and kind='ADJUSTMENT' and confirmed) then raise exception 'Inventory cannot become negative';end if;
+update supplier_items set current_quantity=current_quantity+delta,updated_at=now() where id=a.id;
+insert into inventory_movements(supplier_item_id,item_id,supplier_id,movement_type,quantity,previous_quantity,new_quantity,reference,notes,user_id) values(a.id,a.item_id,a.supplier_id,kind,delta,a.current_quantity,a.current_quantity+delta,ref,memo,auth.uid()) returning * into m;return m;end$$;
+create function public.receive_incoming(incoming_id uuid) returns public.inventory_movements language plpgsql security definer set search_path=public as $$declare r incoming_inventory;m inventory_movements;begin
+select * into r from incoming_inventory where id=incoming_id for update;
+if not found or r.status<>'OPEN' or not(is_admin() or r.supplier_id=own_supplier()) then raise exception 'Open shipment not found';end if;
+m:=record_movement(r.supplier_item_id,'RECEIPT',r.quantity,r.reference,'Received incoming shipment',true);
+update incoming_inventory set status='RECEIVED' where id=r.id;return m;end$$;
+revoke all on function public.record_movement(uuid,text,numeric,text,text,boolean) from public;grant execute on function public.record_movement(uuid,text,numeric,text,text,boolean) to authenticated;
+revoke all on function public.receive_incoming(uuid) from public;grant execute on function public.receive_incoming(uuid) to authenticated;
+create function public.create_profile() returns trigger language plpgsql security definer set search_path=public as $$begin insert into profiles(id,email,name) values(new.id,new.email,coalesce(new.raw_user_meta_data->>'name','New user'));return new;end$$;
+create trigger on_auth_user_created after insert on auth.users for each row execute function public.create_profile();
+insert into categories(name,description) values('Boxes','Produce cartons and trays'),('Bags & Film','Flexible packaging'),('Labels','Product and traceability labels');
+insert into units(name) values('Pieces'),('Boxes'),('Rolls'),('Labels'),('Pounds'),('Pallets');
+insert into settings default values;
